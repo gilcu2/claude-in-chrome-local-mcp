@@ -102,6 +102,9 @@ STALE_TAB_ERROR_MARKERS = (
 # does, and the bridge auto-injects the active tab's id when the caller omits it.
 NO_TABID_TOOLS = frozenset({"tabs_context_mcp", "tabs_create_mcp"})
 
+# URLs of a tab nothing has been loaded into yet.
+BLANK_TAB_URLS = frozenset({"", "about:blank", "chrome://newtab/", "chrome://new-tab-page/"})
+
 # Known browser tools provided by the Chrome extension.
 # These are the tools that "Claude in Chrome" exposes for browser control.
 BROWSER_TOOLS = [
@@ -525,6 +528,10 @@ class MCPServer:
         self.active_tab_id: int | None = None
         self.tab_group_id: int | None = None
         self.tab_group_initialized = False
+        # The blank tab tabs_context_mcp(createIfEmpty) opens with a new group.
+        # The first browser_tab_new takes it instead of opening a second tab
+        # beside it, which would leave it empty for the rest of the session.
+        self.blank_tab_id: int | None = None
 
     # -- stdio helpers (MCP JSON-RPC) -----------------------------------------
 
@@ -819,6 +826,8 @@ class MCPServer:
                     try:
                         data = json.loads(text)
                         tabs = data.get("availableTabs", [])
+                        if len(tabs) == 1 and tabs[0].get("url", "") in BLANK_TAB_URLS:
+                            self.blank_tab_id = self._extract_tab_id(tabs[0])
                         if tabs:
                             # Pick the first non-chrome:// tab, or first tab
                             for tab in tabs:
@@ -878,6 +887,7 @@ class MCPServer:
         self.active_tab_id = None
         self.tab_group_id = None
         self.tab_group_initialized = False
+        self.blank_tab_id = None
 
     def _inject_tab_id(self, internal_name: str, tool_args: dict) -> dict:
         """Return a copy of tool_args with the active tabId injected when needed."""
@@ -1201,7 +1211,7 @@ class MCPServer:
                 },
                 "serverInfo": {
                     "name": "chrome-browser-mcp",
-                    "version": "1.3.0",
+                    "version": "1.3.1",
                 },
             },
         }
@@ -1279,6 +1289,16 @@ class MCPServer:
         if not await self._ensure_tab_group():
             return reply(self._error_result(
                 "Could not initialize the MCP tab group. Make sure Chrome has at least one tab open."))
+
+        # Only the call right after the group was created may take its blank
+        # tab; once anything else has run, the tab is in use.
+        blank_tab, self.blank_tab_id = self.blank_tab_id, None
+        if tool_name == "browser_tab_new" and blank_tab is not None:
+            self.active_tab_id = blank_tab
+            if tool_args.get("url"):
+                calls = [("navigate", {"url": tool_args["url"], "tabId": blank_tab})]
+            else:
+                calls = [("tabs_context_mcp", {})]
 
         result = await self._run_call_chain(calls)
 

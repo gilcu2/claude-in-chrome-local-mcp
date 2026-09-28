@@ -82,6 +82,8 @@ def save_aliases(aliases: dict) -> None:
 # Reconnect settings
 RECONNECT_INTERVAL = 2.0
 MAX_RECONNECT_INTERVAL = 30.0
+# Per-request budget for the teardown round-trips; shutdown must not hang.
+SHUTDOWN_TIMEOUT = 5.0
 
 # Socket error texts that mean the cached MCP tab group / active tab is gone
 # (the user closed the tab, or Chrome suspended the extension service worker
@@ -1394,6 +1396,66 @@ class MCPServer:
         finally:
             self.running = False
 
+    # -- Session teardown -----------------------------------------------------
+
+    def _tab_ids_from_result(self, result: dict) -> list[int]:
+        """Every tabId in a tabs_context_mcp response (group-scoped), selected one last.
+
+        Closing the group's selected tab makes the extension drop the socket, so
+        it has to be the last one we close or the rest never get their turn.
+        """
+        ids: list[int] = []
+        selected = None
+        try:
+            for item in result.get("result", {}).get("content", []):
+                if not (isinstance(item, dict) and item.get("type") == "text"):
+                    continue
+                try:
+                    data = json.loads(item["text"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                for tab in data.get("availableTabs", []):
+                    tid = self._extract_tab_id(tab)
+                    if tid is not None and int(tid) not in ids:
+                        ids.append(int(tid))
+                if data.get("selectedTabId") is not None:
+                    selected = int(data["selectedTabId"])
+        except Exception:
+            log.exception("Failed to read tab ids for session cleanup")
+        if selected in ids:
+            ids = [t for t in ids if t != selected] + [selected]
+        return ids
+
+    async def _close_session_tabs(self) -> None:
+        """Close this session's tab group when the session ends.
+
+        The group belongs to this MCP run, so nothing outside it is touched.
+        Set CHROME_MCP_KEEP_TABS=1 to leave the tabs open instead.
+        """
+        if os.environ.get("CHROME_MCP_KEEP_TABS"):
+            log.info("CHROME_MCP_KEEP_TABS set, leaving session tabs open")
+            return
+        if not self.socket_connected or not self.tab_group_initialized:
+            return
+
+        # _read_socket_loop stops as soon as self.running is False, and stdin EOF
+        # already cleared it. Hold it True for the teardown round-trips.
+        prev_running, self.running = self.running, True
+        try:
+            listed = await self._send_and_wait("tabs_context_mcp", {}, timeout=SHUTDOWN_TIMEOUT)
+            tab_ids = self._tab_ids_from_result(listed)
+            if not tab_ids:
+                return
+            log.info("Closing %d session tab(s): %s", len(tab_ids), tab_ids)
+            for tid in tab_ids:
+                await self._send_and_wait(
+                    "tabs_close_mcp", {"tabId": tid}, timeout=SHUTDOWN_TIMEOUT
+                )
+        except Exception:
+            log.exception("Session tab cleanup failed")
+        finally:
+            self.running = prev_running
+
     # -- Lifecycle ------------------------------------------------------------
 
     def _shutdown(self) -> None:
@@ -1415,10 +1477,22 @@ class MCPServer:
         # Start background socket connection maintainer
         socket_task = asyncio.create_task(self._maintain_socket_connection())
 
-        # Process stdin
+        # Process stdin. SIGTERM/SIGINT cancel the read so shutdown (and the tab
+        # cleanup below) actually runs instead of blocking forever in readline().
+        stdin_task = asyncio.create_task(self._read_stdin_loop())
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, stdin_task.cancel)
+            except (NotImplementedError, RuntimeError):
+                pass
+
         try:
-            await self._read_stdin_loop()
+            await stdin_task
+        except asyncio.CancelledError:
+            log.info("Signal received, shutting down")
         finally:
+            await self._close_session_tabs()
             self.running = False
             socket_task.cancel()
             try:

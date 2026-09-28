@@ -13,7 +13,7 @@ Supports multiple simultaneous client connections and works with any MCP client.
 - **Works with any MCP client** — not limited to Claude Desktop / Code
 - **Claude Desktop + Code coexistence** — avoids native host conflict ([#20887](https://github.com/anthropics/claude-code/issues/20887))
 - **Full extension toolset exposed** — clicks (right/double/triple + modifier keys), hover, drag, key press, wait, window resize, page-text extraction, network log, form input, file/image upload, zoom, and more
-- **Official-style session management** — sends `session_scope` on every request so the extension manages tab groups per-session, the same way the official "Claude in Chrome" does. The MCP does NOT auto-close any of your tabs on shutdown
+- **Official-style session management** — sends `session_scope` on every request so the extension manages tab groups per-session, the same way the official "Claude in Chrome" does. On shutdown it closes that group's tabs — only tabs it opened itself, never yours. Set `CHROME_MCP_KEEP_TABS=1` to leave them open
 - **Pick which Chrome profile to connect to** — at startup via `--socket` / `CHROME_MCP_SOCKET`, or at runtime with the `browser_list_profiles` / `browser_select_profile` tools
 
 ## Architecture
